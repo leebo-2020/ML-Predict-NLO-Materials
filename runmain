@@ -1,0 +1,107 @@
+import pandas as pd
+import seaborn as sns
+from matplotlib.ticker import MultipleLocator 
+from mrmr import mrmr_regression
+from sklearn.preprocessing import StandardScaler
+import os, sys, warnings, joblib, models
+from sklearn.model_selection import train_test_split
+from models import permutation_importance_multicollinear as pimc
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['axes.unicode_minus'] = False
+plt.rcParams['font.serif'] = 'Times New Roman'
+warnings.filterwarnings("ignore")
+cv = 5
+gan_num_batch = 5
+gan_num_epochs = 100
+n_repeat = 50
+fs_thres = 0.1
+max_eval = 300
+y_name = 'beta'
+comp_name = 'compounds'
+test_size_ratio = 0.20
+val_split_ratio = 0.125
+y_name_label = r'$\beta$'
+drop_list = [comp_name, y_name]
+xlabel = r'DFT-calculated $\beta$ Value (au)'
+ylabel = r'Predicted $\beta$ Value (au)'
+selected_model_name_list = ['AB','CB','RF','GBR','DTR','ETR','XGB','HGBR','LGBM']
+stacking_topn_model = 5
+
+#-------------------color for train and test----------------#
+train_test_color = ['#ff7800','#00AFF0','#E7238C']#橙色和浅蓝色,pink
+
+feature_select_color = ['#ff7800','#00AFF0','#E7238C']
+
+shap_color = [plt.cm.autumn, plt.cm.spring, plt.cm.hsv]
+ccm_color  = [plt.cm.hsv]
+
+# Read data
+df = pd.read_excel(sys.argv[1])
+df = df.drop(df[df[y_name]<1].index)
+# Read and deal with y
+y = df[y_name]
+
+#feature select based on permutation importance handle multicollinear
+X = df.drop(drop_list, axis=1)
+n_features = X.shape[1]
+num_alpha, enc_max_iter = 1500, 5000
+num_l1_ratio, alpha_start, alpha_end = 1500, -8, 3
+elasticnetcv_selected_results = models.elasticnetcv_feature_select(X, y, 
+                                num_l1_ratio, alpha_start, alpha_end, 
+                                num_alpha, enc_max_iter, cv, test_size_ratio, 
+                                val_split_ratio)
+X = f[elasticnetcv_selected_results['selected_features'].tolist()]
+keep_features = pimc(X, fs_thres, n_repeat)
+#--------------------------mRMR Feature Reorder----------------------------#
+reorder_keep_features_results = mrmr_regression(X=X, y=y, K=len(keep_features), 
+                                                return_scores=True)
+feature_scores_dict = dict(reorder_keep_features_results[1])
+feature_scores_dict = {k:v for k, v in feature_scores_dict.items() if v>20}
+#reorder_keep_features = reorder_keep_features_results[0]
+sorted_feature_scores_dict = dict(sorted(feature_scores_dict.items(), 
+                                  key = lambda kv:(kv[1], kv[0])))
+reorder_keep_features = list(sorted_feature_scores_dict.keys())[::-1]
+X_reorder = df[reorder_keep_features]
+#----re-selected features from reorder_keep_features----#
+sm_om_dict = {}
+stkm_om_dict = {}
+for topn in range(1, len(reorder_keep_features)+1) :
+    folder_path = 'top-%i-features-train-results'%topn
+    if os.path.exists(folder_path): 
+        os.system('cp %s/*.pkl .'%folder_path)
+    topn_features = reorder_keep_features[:topn]
+    print('Top %i features are used to train model\n'%topn)
+    print(topn_features)
+    X = X_reorder[topn_features]
+    #---划分训练集,验证集,测试集---#
+    X_temp, X_test, y_temp, y_test = train_test_split(X,y,test_size=test_size_ratio, random_state=42)
+    X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=val_split_ratio,random_state=42)
+    #-----------------特征缩放处理-------------------#
+    X_train = pd.DataFrame(StandardScaler().fit_transform(X_train),columns=X_train.columns)
+    X_test = pd.DataFrame(StandardScaler().fit_transform(X_test),columns=X_test.columns))
+    X_val = pd.DataFrame(StandardScaler().fit_transform(X_val), columns=X_val.column)
+    #---------优化模型---------------#
+    models_dict = {}
+    for model_name in selected_model_name_list :
+        if os.path.exists(model_name + '-all-features-sm.pkl') :
+            models_dict[model_name] = joblib.load(model_name + '-all-features-sm.pkl')
+        else :
+            models_dict[model_name] = opt_hp(X_train, y_train, X_val, 
+                                  y_val, max_eval, [model_name])[model_name]
+    ####drawing metrics of model predict target and model rank####
+    num_models = len(selected_model_name_list)
+    #######build and train stacking model#######
+    # stacking model
+    selected_topnsm_models_dict = {}
+    stacking_topn_model_list = ranked_model_list[:stacking_topn_model]
+    for model_name in stacking_topn_model_list :
+        selected_topnsm_models_dict[model_name] = models_dict[model_name]
+    print('Starting all stacking models training')
+    all_stkms = models.find_optimal_stacking_model(selected_topnsm_models_dict,
+                                          X_train, y_train, X_test, y_test, cv, 
+                                          xlabel, ylabel)
+    print('Completing all stacking models training')
+    ostkm_mn = stkm_xlabel_list[-1]
+    topn_optimal_model_name = 'Top%i-'%topn + ostkm_mn
+    stkm_om_dict[topn_optimal_model_name] = all_stkms[stkm_xlabel_list[-1]]
+    #------------------------------------------------------------------
