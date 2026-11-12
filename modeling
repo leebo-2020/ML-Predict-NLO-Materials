@@ -1,0 +1,281 @@
+import os,sys
+import joblib
+import warnings
+import numpy as np
+import pandas as pd
+from patsy import dmatrix
+from scipy.stats import pearsonr
+import scipy.stats.distributions as dists
+from collections import defaultdict
+from scipy.stats import spearmanr
+from scipy.cluster import hierarchy
+from scipy.spatial.distance import squareform
+from sklearn.inspection import permutation_importance
+from itertools import combinations
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from sklearn.linear_model import ElasticNetCV
+from hyperopt import fmin, tpe, hp, space_eval
+from catboost import CatBoostRegressor
+from sklearn.metrics import mean_squared_error
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.tree import ExtraTreeRegressor
+from sklearn.ensemble import AdaBoostRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.ensemble import StackingRegressor
+from sklearn.model_selection import cross_val_score, KFold
+from sklearn.metrics import mean_absolute_error 
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+warnings.filterwarnings("ignore")
+plt.rcParams['axes.unicode_minus'] = False
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif']  = 'Times New Roman'
+
+n_end,d_end,nl_end,ns_end,rl_end = 500,500,500,500,500,500
+#CatBoost parameters space
+loss_cat_list = ['RMSE','MAE','MAPE']
+eval_metric_cat_list = ['RMSE','MAE','MAPE']
+bootstrap_type_list = ['Bayesian','Bernoulli','MVS']
+parameter_space_cat= {
+    'eval_metric':hp.choice('eval_metric',eval_metric_cat_list),
+    'loss_function':hp.choice('loss_function',loss_cat_list),
+    'bootstrap_type':hp.choice('bootstrap_type',bootstrap_type_list),
+    'iterations':hp.choice('iterations', [n_it for n_it in range(1,n_end)]),
+    'depth':hp.choice('depth', [n_it for n_it in range(1,17)]),
+    'l2_leaf_reg':hp.choice('l2_leaf_reg', [n_it for n_it in range(3,n_end)]),
+    'learning_rate': hp.loguniform('learning_rate', -10, 0)}
+
+#GBDT parameters space
+gbdt_loss_list = ['squared_error', 'absolute_error']
+gbdt_criterion_list = ['friedman_mse', 'squared_error']
+parameter_space_gbdt = {
+    'loss':hp.choice('loss', gbdt_loss_list),
+    'criterion':hp.choice('criterion', gbdt_criterion_list),
+    'n_estimators':hp.choice('n_estimators', [n_it for n_it in range(1,n_end)]),
+    'min_samples_leaf':hp.choice('min_samples_leaf', [n_it for n_it in range(1,n_end)]),
+    'max_leaf_nodes':hp.choice('max_leaf_nodes', [n_it for n_it in range(2,n_end)]),
+    'learning_rate': hp.loguniform('learning_rate', -10, 0),
+    'max_depth': hp.choice('max_depth',[md for md in range(1, md_end)])}
+
+#HGBDT parameters space
+hgbdt_loss_list = ['squared_error','absolute_error']
+parameter_space_hgbdt = {
+    'loss':hp.choice('loss', hgbdt_loss_list),
+    'max_iter':hp.choice('max_iter', [n_it for n_it in range(1,n_end)]),
+    'min_samples_leaf':hp.choice('min_samples_leaf', [n_it for n_it in range(1,n_end)]),
+    'max_leaf_nodes':hp.choice('max_leaf_nodes', [n_it for n_it in range(2,n_end)]),
+    'learning_rate': hp.loguniform('learning_rate', -10, 0),
+    'l2_regularization': hp.uniform('l2_regularization', 0.00, 1.0),
+    'max_depth': hp.choice('max_depth',[md for md in range(1, md_end)])}
+
+#LGBM parameters space
+parameter_space_lgbm = {
+    'n_estimators':hp.choice('n_estimators', [n_it for n_it in range(1,n_end)]),
+    'max_depth': hp.choice('max_depth',[md for md in range(1, md_end)]),
+    'reg_alpha':hp.uniform('reg_alpha', 0.001, 1.0),
+    'reg_lambda':hp.uniform('reg_lambda', 0.001, 10.0),
+    'learning_rate': hp.loguniform('learning_rate', -10, 0),
+    'subsample': hp.uniform('subsample', 0.001, 1.0), # 线性均匀分布的连续浮点数范围
+    'colsample_bytree': hp.uniform('colsample_bytree', 0.001, 1.0)}
+
+#XGB parameters space
+parameter_space_xgb = {
+    'max_depth': hp.choice('max_depth',[md for md in range(1, md_end)]),
+    'n_estimators': hp.choice('n_estimators',[ns for ns in range(1,ns_end)]),
+    'learning_rate': hp.loguniform('learning_rate', -10, 0),
+    'reg_alpha':hp.uniform('reg_alpha', 0.001, 1.0),
+    'reg_lambda':hp.uniform('reg_lambda', 0.001, 10.0),
+    'gamma': hp.uniform('gamma', 0, 100),
+    'subsample': hp.uniform('subsample', 0.001, 1.0), # 线性均匀分布的连续浮点数范围
+    'colsample_bytree': hp.uniform('colsample_bytree', 0.001, 1.0)}
+
+#RF parameters space
+criterion_rf_list = ['squared_error', 'absolute_error']
+parameter_space_rf = {
+    'criterion':hp.choice('criterion', criterion_rf_list),
+    'n_estimators': hp.choice('n_estimators', [n_it for n_it in range(1,n_end)]),
+    'max_depth': hp.choice('max_depth', [d_it for d_it in range(1,d_end)]),
+    'min_samples_split': hp.uniform('min_samples_split', 0, 1.0),
+    'min_weight_fraction_leaf': hp.uniform('min_weight_fraction_leaf', 0.0, 0.5),
+    'min_samples_leaf': hp.uniform('min_samples_leaf', 0.0, 1.0)}
+
+#AdaBoost
+adab_regressor_list = [XGBRegressor(), LGBMRegressor()]
+parameter_space_adab= {
+    'estimator':hp.choice('estimator', adab_regressor_list),
+    'n_estimators':hp.choice('n_estimators', [n_it for n_it in range(1,n_end)]),
+    'loss': hp.choice('loss', ['linear','square','exponential']),
+    'learning_rate': hp.loguniform('learning_rate', -10, 0)}
+###DecisionTreesRegressor###
+dtr_criterion_list = ['squared_error', 'absolute_error']
+parameter_space_dtr= {
+    'criterion':hp.choice('criterion',dtr_criterion_list),
+    'max_depth':hp.choice('max_depth', [n_it for n_it in range(1,n_end)]),
+    'min_weight_fraction_leaf': hp.uniform('min_weight_fraction_leaf', 0.0, 0.5),
+    'min_samples_split':hp.uniform('min_samples_split', 0.0,1.0),
+    'min_samples_leaf':hp.uniform('min_samples_leaf', 0.0,1.0),
+    'max_leaf_nodes':hp.choice('max_leaf_nodes', [n_it for n_it in range(2,n_end)])}
+###ExtraTreeRegressor###
+etr_criterion_list = ['squared_error','absolute_error']
+parameter_space_etr= {
+    'criterion':hp.choice('criterion',etr_criterion_list),
+    'max_depth':hp.choice('max_depth', [n_it for n_it in range(1,n_end)]),
+    'max_leaf_nodes':hp.choice('max_leaf_nodes', [n_it for n_it in range(2,n_end)]),
+    'min_weight_fraction_leaf': hp.uniform('min_weight_fraction_leaf', 0.0, 0.5),
+    'min_samples_split':hp.uniform('min_samples_split', 0.0, 1.0),
+    'min_samples_leaf':hp.uniform('min_samples_leaf', 0.0, 1.0)}
+
+
+def stacking_model_combination(models_dict, X_train, y_train, X_val, y_val, kf) :
+    all_stkms = {}
+    model_combinations = [ ]
+    model_name_list = list(models_dict.keys())
+    for num in range(2,len(model_name_list)+1):
+        combs = list(combinations(model_name_list,num))
+        model_combinations.append(combs)
+    for sub_model_combination in model_combinations :
+        for smc in sub_model_combination :
+            base_learners = [ ]
+            smc_list = list(smc)
+            smc_name = '-'.join(smc_list)
+            for sn in smc_list :
+                base_learners.append((sn, models_dict[sn]))
+            # 定义二级学习器
+            base_learners_dict = dict(base_learners)
+            stkm_ranked_df_val = cal_comprehensive_rank(base_learners_dict, X_val, y_val)
+            meta_model_name = stkm_ranked_df_val['Model'].tolist()[::-1][0]
+            meta_model = base_learners_dict[meta_model_name]
+            # 创建Stacking回归器
+            stkm = StackingRegressor(estimators=base_learners, final_estimator=meta_model, cv=kf)
+            # 训练模型
+            stkm.fit(X_train, y_train)
+            all_stkms[smc_name] = stkm 
+    stkm_ranked_df_simplified = cal_comprehensive_rank(all_stkms, X_val, y_val)
+    optimal_model_name = stkm_ranked_df_simplified['Model'].tolist()[-1]
+    optimal_model = all_stkms[optimal_model_name]
+    return optimal_model
+
+def opt_hp(X_train, y_train, X_val, y_val, max_eval, 
+           selected_model_name_list, save_all_feature_model=None) :
+    models_dict = {}
+    if save_all_feature_model is None : save_all_feature_model = True
+    for sub_sm_model_name in selected_model_name_list :
+        if sub_sm_model_name == 'AB' :
+            best_sm_model = find_optimal_adab_model(X_train, y_train, X_val, y_val, max_eval)
+        elif sub_sm_model_name == 'CB' :
+            best_sm_model  = find_optimal_cat_model(X_train, y_train, X_val, y_val, max_eval)
+        elif sub_sm_model_name == 'RF' :
+            best_sm_model   = find_optimal_rf_model(X_train, y_train, X_val, y_val, max_eval)
+        elif sub_sm_model_name == 'GBR' :
+            best_sm_model = find_optimal_gbdt_model(X_train, y_train, X_val, y_val, max_eval)
+        elif sub_sm_model_name == 'XGB' :
+            best_sm_model  = find_optimal_xgb_model(X_train, y_train, X_val, y_val, max_eval)
+        elif sub_sm_model_name == 'NGB' :
+            best_sm_model  = find_optimal_ngb_model(X_train, y_train, X_val, y_val, max_eval)
+        elif sub_sm_model_name == 'DTR' :
+            best_sm_model  = find_optimal_dtr_model(X_train, y_train, X_val, y_val, max_eval)
+        elif sub_sm_model_name == 'ETR' :
+            best_sm_model  = find_optimal_etr_model(X_train, y_train, X_val, y_val, max_eval)
+        elif sub_sm_model_name == 'HGBR' :
+            best_sm_model  = find_optimal_hgbdt_model(X_train, y_train, X_val, y_val, max_eval)
+        elif sub_sm_model_name == 'LGBM' :
+            best_sm_model = find_optimal_lgbm_model(X_train, y_train, X_val, y_val, max_eval)
+        if save_all_feature_model :
+            joblib.dump(best_sm_model, sub_sm_model_name + '-all-features-sm.pkl')
+        models_dict[sub_sm_model_name] = best_sm_model
+    return models_dict
+
+# build stacking model
+def find_optimal_stacking_model(models_dict, X_train, y_train, X_test, y_test, 
+                                cv, xlabel, ylabel) :
+    # find the combinations of all model
+    tmp_model_name = [ ]
+    for model_name, model in models_dict.items():
+        tmp_model_name.append(model_name)
+    model_combinations = [ ]
+    for num in range(2,len(tmp_model_name)+1):
+        tmp1 = list(combinations(tmp_model_name,num))
+        model_combinations.append(tmp1)
+    all_stkms = {}
+    for sub_model_combination in model_combinations :
+        for idx, smc in enumerate(sub_model_combination) :
+            base_learners = [ ]
+            smc_list = list(smc)
+            smc_name = '-'.join(smc_list)
+            if os.path.exists(smc_name + '-all-features-best-stkm.pkl') :
+                all_stkms[smc_name] = joblib.load(smc_name + '-all-features-best-stkm.pkl')
+            else :
+                for sn in smc_list :
+                    base_learners.append((sn, models_dict[sn]))
+                # 创建Stacking回归器
+                kf = KFold(n_splits=cv, shuffle=True, random_state=42)
+                meta_model = 
+                stacking_regressor = StackingRegressor(estimators=base_learners, 
+                                     final_estimator=stkm_final_estimator,cv=kf)
+                # 训练模型
+                stacking_regressor.fit(X_train, y_train)
+                joblib.dump(stacking_regressor, smc_name + '-all-features-best-stkm.pkl')
+                all_stkms[smc_name] = stacking_regressor 
+    return all_stkms 
+
+def elasticnetcv_feature_select(X, y, num_l1_ratio, alpha_start, alpha_end, num_alpha,
+                                max_iter, cv, test_size_ratio, val_split_ratio):
+    ####划分训练集,验证集,测试集,特征预处理####
+    X_temp, X_test, y_temp, y_test = train_test_split(X, y, 
+                                     test_size=test_size_ratio,
+                                     random_state=42)
+    X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, 
+                                     test_size=val_split_ratio, 
+                                     random_state=42)
+    X_train = pd.DataFrame(StandardScaler().fit_transform(X_train),columns=X_train.columns)
+    X_test = pd.DataFrame(StandardScaler().fit_transform(X_test),columns=X_test.columns))
+    X_val = pd.DataFrame(StandardScaler().fit_transform(X_val), columns=X_val.column)
+    alphas = np.logspace(alpha_start, alpha_end, num_l1_ratio)
+    # 设定弹性网络模型并进行交叉验证以选择最佳超参数
+    if not os.path.exists('elastic_net_feature_select_model.pkl') :
+        elastic_net = ElasticNetCV(l1_ratio=np.linspace(0.1, 1, num_l1_ratio),
+                     alphas=alphas, cv=cv, max_iter=max_iter, random_state=42)
+        elastic_net.fit(X_train, y_train)
+        joblib.dump(elastic_net, 'elastic_net_feature_select_model.pkl')
+    else :
+        elastic_net = joblib.load('elastic_net_feature_select_model.pkl')
+    # 获取特征系数
+    feature_coef = elastic_net.coef_
+    # 获取Best alpha 和 Best l1_ratio
+    best_alpha = elastic_net.alpha_
+    best_l1_ratio = elastic_net.l1_ratio_ 
+    #获取系数部位0的特征
+    selected_features = X.columns[feature_coef != 0]
+    print('Selected Features by Elastic Net:\n', selected_features.tolist())
+    coefs = []
+    # 遍历每个alpha值，记录对应的系数
+    for a in alphas:
+        enet = ElasticNetCV(l1_ratio=best_l1_ratio, alphas=[a], max_iter=max_iter, random_state=42)
+        enet.fit(X_train, y_train)
+        coefs.append(enet.coef_)
+    elasticnetcv_selected_results = {'alphas':alphas, 'coefs':coefs, 'best_alpha':best_alpha, 
+                                     'best_l1_ratio':best_l1_ratio, 'feature_coef':feature_coef, 
+                                     'selected_features':selected_features}
+    return elasticnetcv_selected_results
+
+def permutation_importance_multicollinear(X, fs_thres, n_repeat) :
+    # 划分训练集和测试集
+    corr = spearmanr(X).correlation
+    corr = (corr + corr.T) / 2
+    np.fill_diagonal(corr, 1)
+    # We convert the correlation matrix to a distance matrix before performing
+    # hierarchical clustering using Ward's linkage.
+    distance_matrix = 1 - np.abs(corr)
+    dist_linkage = hierarchy.ward(squareform(distance_matrix))
+    #########feature select#######
+    cluster_ids = hierarchy.fcluster(dist_linkage, fs_thres, criterion="distance")
+    cluster_id_to_feature_ids = defaultdict(list)
+    for idx, cluster_id in enumerate(cluster_ids):
+        cluster_id_to_feature_ids[cluster_id].append(idx)
+    selected_features = [v[0] for v in cluster_id_to_feature_ids.values()]
+    selected_features_names = X.columns[selected_features]
+    return selected_features_names.tolist()
+
